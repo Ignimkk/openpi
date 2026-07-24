@@ -965,6 +965,68 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+        #
+    # RBY1 configs.
+    #
+    TrainConfig(
+        # LoRA fine-tune of pi05 on the rby1_dataset_v1 bimanual pick-and-place dataset.
+        name="pi05_rby1_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/rby1_dataset_v1",
+            # RBY1 is not Trossen hardware -- adapt_to_pi only applies Trossen-specific
+            # gripper/joint-sign conversion (see aloha_policy._decode_state/_encode_actions),
+            # which does not apply here. With adapt_to_pi=False, AlohaInputs/AlohaOutputs
+            # reduce to a generic dual-arm passthrough, which is what we want since our
+            # state/action layout ([6 joints + 1 gripper] x 2 arms) matches Aloha's exactly.
+            adapt_to_pi=False,
+            # Joints as delta-from-current-state, gripper stays absolute (PI's standard
+            # bimanual convention). Our raw actions are absolute joint targets.
+            use_delta_joint_actions=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            # NOTE: no asset_id override -- compute_norm_stats.py writes to
+            # assets_dirs/repo_id (ignores asset_id), so asset_id must default to
+            # repo_id for _load_norm_stats to find what we just computed.
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning (matches pi0_libero_low_mem_finetune precedent).
+        ema_decay=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        log_interval=100,
+        save_interval=5_000,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
