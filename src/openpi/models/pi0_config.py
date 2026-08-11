@@ -31,6 +31,11 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Inference-only. When True the LLM returns post-softmax attention probabilities alongside its
+    # outputs, so a caller can read a single (layer, head) attention map without a second forward
+    # pass. Adds no parameters, so the same checkpoints load either way. `sample_actions` is not
+    # supported while this is on -- drive the prefix/suffix passes directly instead.
+    return_attn_probs: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 

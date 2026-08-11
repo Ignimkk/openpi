@@ -161,7 +161,12 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, return_probs=False):  # noqa: FBT002
+        # `return_probs` is an OPTIONAL, inference-only flag. When False (the default) this module is
+        # byte-for-byte identical to the original: the extra return value is None and nothing extra is
+        # materialized. When True, the post-softmax attention probabilities are returned so that callers
+        # can read a specific (layer, head) attention map without a second forward pass. Used by the
+        # KNOWS attention-guided safety filter probe.
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -246,7 +251,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v)
+        return out, (k, v), (probs if return_probs else None)
 
 
 @at.typecheck
@@ -288,6 +293,10 @@ class Block(nn.Module):
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
+    # Static (dataclass) flag, NOT a call argument: anything routed through `nn.scan` becomes a
+    # tracer, and a tracer cannot drive the Python branch that decides whether to materialize the
+    # attention probabilities. See papers/KNOWS/06-repro-plan.md.
+    return_probs: bool = False
 
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
@@ -305,7 +314,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, kv_cache, probs = attn(pre_attn, positions, attn_mask, kv_cache, self.return_probs)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
@@ -330,7 +339,7 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache
+        return xs, (kv_cache, probs)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -346,6 +355,10 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # Inference-only. When True, `__call__` returns a third element holding post-softmax attention
+    # probabilities stacked over layers, shape [L, B, K, G, T, S]. Default False adds no parameters,
+    # materializes nothing, and leaves the 2-tuple contract untouched, so checkpoints are shared.
+    return_probs: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -378,6 +391,7 @@ class Module(nn.Module):
             configs=self.configs,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
+            return_probs=self.return_probs,
         )
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
@@ -396,19 +410,27 @@ class Module(nn.Module):
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+    ) -> (
+        tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]
+        | tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache, at.Array]
+    ):
+        # Returns a 3-tuple (with stacked attention probabilities) iff this module was constructed
+        # with `return_probs=True`; otherwise the original 2-tuple. See the class field.
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        embedded, (kv_cache, probs) = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
-        return [
+        normed = [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        if self.return_probs:
+            return normed, kv_cache, probs
+        return normed, kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
