@@ -82,6 +82,10 @@ class DataConfig:
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
+    # Optional LeRobot episode indexes. Keep this explicit for local datasets so
+    # validation/test episodes are not silently included in training.
+    episodes: Sequence[int] | None = None
+
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
@@ -1015,6 +1019,60 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning (matches pi0_libero_low_mem_finetune precedent).
+        ema_decay=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        log_interval=100,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        # Atomic fruit-to-basket v2 dataset. Only the contiguous train range is
+        # exposed to normalization and optimization; validation/test stay held out.
+        name="pi05_rby1_atomic_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/rby1_atomic_basket_14d_v2",
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(1591)),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
         ema_decay=None,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
