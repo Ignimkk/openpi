@@ -240,6 +240,9 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
+    # Number of arm joints before each gripper. ALOHA uses six; RBY1's full
+    # dual-arm interface uses seven. Existing configs retain the six-joint default.
+    arm_joint_dim: int = 6
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -260,12 +263,22 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.arm_joint_dim <= 0:
+            raise ValueError("arm_joint_dim must be positive")
+        if self.adapt_to_pi and self.arm_joint_dim != 6:
+            raise ValueError("ALOHA hardware conversion only supports six joints per arm")
+        action_dim = 2 * (self.arm_joint_dim + 1)
         data_transforms = _transforms.Group(
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[aloha_policy.AlohaOutputs(
+                adapt_to_pi=self.adapt_to_pi,
+                action_dim=action_dim,
+            )],
         )
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            delta_action_mask = _transforms.make_bool_mask(
+                self.arm_joint_dim, -1, self.arm_joint_dim, -1
+            )
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -1063,6 +1076,60 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
                 episodes=tuple(range(1591)),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        log_interval=100,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        # Full 7-DoF-per-arm randomized fruit-to-basket demonstrations.
+        name="pi05_rby1_randomized_pick_place_16d_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="local/rby1_randomized_pick_place_16d_v1",
+            adapt_to_pi=False,
+            arm_joint_dim=7,
+            use_delta_joint_actions=True,
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes=tuple(range(1600)),
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
