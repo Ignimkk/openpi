@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import os
 from typing import Protocol
 
 from etils import epath
@@ -17,9 +18,47 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 
+def disable_tensorstore_file_locking() -> bool:
+    """Stop tensorstore from using lock files when committing checkpoint writes.
+
+    tensorstore's file kvstore commits every array by writing `<name>.__lock`, taking a
+    lock on that file, and renaming it onto `<name>` while the lock is still held. An NFS
+    mount that forwards locks to the server (`local_lock=none`) refuses that rename with
+    EBUSY, which aborts the whole checkpoint. Training is a single writer per checkpoint
+    directory, so dropping the lock is safe.
+
+    Set OPENPI_TS_FILE_LOCKING=1 to keep tensorstore's default behavior.
+    """
+    if os.environ.get("OPENPI_TS_FILE_LOCKING") == "1":
+        return False
+
+    from orbax.checkpoint._src.serialization import serialization as ocp_serialization
+    from orbax.checkpoint._src.serialization import tensorstore_utils as ts_utils
+    import tensorstore as ts
+
+    no_locking = {"mode": "none"}
+    try:
+        # get_ts_context() deep-copies these, so mutating them covers every orbax call site.
+        ts_utils._BASE_TS_CONTEXT["file_io_locking"] = no_locking  # noqa: SLF001
+        ts_utils._DEFAULT_OCDBT_TS_CONTEXT["file_io_locking"] = no_locking  # noqa: SLF001
+        ocp_serialization.TS_CONTEXT = ts.Context(
+            {"file_io_concurrency": {"limit": 128}, "file_io_locking": no_locking}
+        )
+    except AttributeError:
+        logging.warning(
+            "Could not disable tensorstore file locking; orbax internals have changed. "
+            "Checkpoint saves to NFS may fail with EBUSY."
+        )
+        return False
+
+    logging.info("Disabled tensorstore file locking for checkpoint writes.")
+    return True
+
+
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
+    disable_tensorstore_file_locking()
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
